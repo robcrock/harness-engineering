@@ -1,55 +1,76 @@
-import { config } from "dotenv";
-// Load secrets from .dev.vars (OPENAI_API_KEY, ...) before anything else.
-config({ path: ".dev.vars" });
+// MUST be first: loads .dev.vars before any module that reads env at load time.
+import "./env";
 
+import { DBOS } from "@dbos-inc/dbos-sdk";
 import express from "express";
 import { createServer } from "node:http";
 import { WebSocketServer, type WebSocket } from "ws";
-import { EventBus, createEmitter } from "./bus";
-import { runAgent } from "../harness/runtime";
-import { EventType, type ClientMessage } from "@shared/events";
+import { ensureSchema, clearEventLog } from "../harness/db";
+import { subscribe, history } from "../harness/bus";
+import { runAgentWorkflow } from "../harness/runtime";
+import type { ClientMessage } from "@shared/events";
 
 const PORT = Number(process.env.PORT ?? 8787);
 
-const app = express();
-app.get("/health", (_req, res) => {
-  res.json({ ok: true });
-});
+async function main() {
+  await ensureSchema();
 
-const server = createServer(app);
-const wss = new WebSocketServer({ server, path: "/ws" });
-const bus = new EventBus();
+  // Point DBOS at the same Postgres for its checkpoint store, then launch it.
+  // launch() ALSO recovers any workflows that were mid-flight when the process
+  // last died, resuming each from its last completed step.
+  DBOS.setConfig({ name: "harness", systemDatabaseUrl: process.env.DATABASE_URL });
+  await DBOS.launch();
 
-// Forward every event the harness emits to all connected inspectors.
-bus.subscribe((event) => {
-  const data = JSON.stringify(event);
-  for (const client of wss.clients) {
-    if (client.readyState === client.OPEN) client.send(data);
-  }
-});
+  const app = express();
+  app.use((_req, res, next) => {
+    res.setHeader("Access-Control-Allow-Origin", "*"); // inspector runs on a different port
+    next();
+  });
+  app.get("/health", (_req, res) => res.json({ ok: true }));
 
-wss.on("connection", (socket: WebSocket) => {
-  // Replay the timeline so far so a fresh inspector isn't blank.
-  for (const event of bus.history()) socket.send(JSON.stringify(event));
+  // Clear the durable log. The inspector calls this, then reloads.
+  app.post("/api/clear", async (_req, res) => {
+    await clearEventLog();
+    res.json({ ok: true });
+  });
 
-  socket.on("message", (raw) => {
-    let message: ClientMessage;
-    try {
-      message = JSON.parse(raw.toString());
-    } catch {
-      return; // ignore anything that isn't valid JSON
-    }
+  const server = createServer(app);
+  const wss = new WebSocketServer({ server, path: "/ws" });
 
-    if (message.type === "submit_task") {
-      const emit = createEmitter(bus);
-      // Fire and forget — the agent reports everything via events, not a return value.
-      runAgent({ input: message.input, emit }).catch((error) => {
-        emit({ type: EventType.Log, level: "error", message: String(error) });
-      });
+  // Forward every emitted event to all connected inspectors.
+  subscribe((event) => {
+    const data = JSON.stringify(event);
+    for (const client of wss.clients) {
+      if (client.readyState === client.OPEN) client.send(data);
     }
   });
-});
 
-server.listen(PORT, () => {
-  console.log(`harness server listening on http://localhost:${PORT}  (ws: /ws)`);
+  wss.on("connection", async (socket: WebSocket) => {
+    // Register the message handler FIRST — history() is an async DB read, and the
+    // client sends as soon as it connects.
+    socket.on("message", async (raw) => {
+      let message: ClientMessage;
+      try {
+        message = JSON.parse(raw.toString());
+      } catch {
+        return;
+      }
+
+      if (message.type === "submit_task") {
+        await DBOS.startWorkflow(runAgentWorkflow)(message.input);
+      }
+    });
+
+    // Replay the durable timeline (including a workflow DBOS is recovering).
+    for (const event of await history()) socket.send(JSON.stringify(event));
+  });
+
+  server.listen(PORT, () => {
+    console.log(`harness server listening on http://localhost:${PORT}  (ws: /ws)`);
+  });
+}
+
+main().catch((error) => {
+  console.error("failed to start:", error);
+  process.exit(1);
 });
